@@ -1,162 +1,121 @@
 use std::collections::HashMap;
-use std::net::{TcpListener, TcpStream};
-use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use serde_json;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use tokio_tungstenite::{accept_async, tungstenite::Message};
+use futures_util::{StreamExt, SinkExt};
 
 type NodeId = String;
+type Clients = Arc<Mutex<HashMap<NodeId, tokio::sync::mpsc::UnboundedSender<String>>>>;
 
-/// Simple relay server - forwards messages between connected clients
-struct RelayServer {
-    clients: Arc<Mutex<HashMap<NodeId, TcpStream>>>,
-}
-
-impl RelayServer {
-    fn new() -> Self {
-        Self {
-            clients: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
+#[tokio::main]
+async fn main() {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "10000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
     
-    fn run(&self, port: u16) -> std::io::Result<()> {
-        let listener = TcpListener::bind(format!("0.0.0.0:{}", port))?;
-        println!("🚀 Relay Server started!");
-        println!("📡 Listening on 0.0.0.0:{}", port);
-        println!("🌐 Clients can connect to this relay\n");
-        
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    let clients = self.clients.clone();
-                    thread::spawn(move || {
-                        if let Err(e) = handle_client(stream, clients) {
-                            eprintln!("Client error: {}", e);
-                        }
-                    });
-                }
-                Err(e) => eprintln!("Connection error: {}", e),
+    println!("╔════════════════════════════════════════╗");
+    println!("║   P2P Relay Server - WebSocket         ║");
+    println!("╚════════════════════════════════════════╝\n");
+    println!("🚀 Starting WebSocket relay server");
+    println!("📡 Listening on {}", addr);
+    
+    let listener = TcpListener::bind(&addr).await.expect("Failed to bind");
+    let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+    
+    println!("✅ Server ready!\n");
+    
+    while let Ok((stream, addr)) = listener.accept().await {
+        let clients = clients.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection(stream, addr, clients).await {
+                eprintln!("Connection error: {}", e);
             }
-        }
-        
-        Ok(())
+        });
     }
 }
 
-fn handle_client(
-    mut stream: TcpStream,
-    clients: Arc<Mutex<HashMap<NodeId, TcpStream>>>,
-) -> std::io::Result<()> {
-    let peer_addr = stream.peer_addr()?;
-    println!("🔌 New connection from: {}", peer_addr);
+async fn handle_connection(stream: TcpStream, addr: SocketAddr, clients: Clients) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🔌 New connection from: {}", addr);
     
-    // Read first message to get node_id (registration)
-    let mut buffer = vec![0u8; 4096];
-    let n = stream.read(&mut buffer)?;
+    // Peek at first bytes to detect HTTP vs WebSocket
+    let mut buf = [0u8; 1024];
+    stream.peek(&mut buf).await?;
     
-    if n == 0 {
-        println!("❌ Client disconnected immediately: {}", peer_addr);
+    let request = String::from_utf8_lossy(&buf);
+    
+    // Check if it's HTTP GET request (health check)
+    if request.starts_with("GET / HTTP") || request.starts_with("GET /health HTTP") {
+        println!("💚 Health check from Render");
+        let mut stream = stream;
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK";
+        stream.try_write(response.as_bytes())?;
         return Ok(());
     }
     
-    // Try to parse as JSON to get node_id
-    let data = &buffer[..n];
-    let node_id = if let Ok(msg) = serde_json::from_slice::<serde_json::Value>(data) {
-        if let Some(from) = msg.get("from").and_then(|v| v.as_str()) {
-            from.to_string()
-        } else {
-            format!("unknown_{}", peer_addr)
-        }
-    } else {
-        format!("unknown_{}", peer_addr)
-    };
+    // Otherwise treat as WebSocket
+    let ws_stream = accept_async(stream).await?;
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     
-    println!("✓ Registered client: {} ({})", node_id, peer_addr);
+    let mut node_id: Option<NodeId> = None;
     
-    // Clone stream for storage
-    let stream_clone = stream.try_clone()?;
-    
-    // Register client
-    {
-        let mut clients_map = clients.lock().unwrap();
-        clients_map.insert(node_id.clone(), stream_clone);
-        println!("📊 Total clients: {}", clients_map.len());
-    }
-    
-    // Forward first message to destination
-    if let Ok(msg) = serde_json::from_slice::<serde_json::Value>(data) {
-        if let Some(to) = msg.get("to").and_then(|v| v.as_str()) {
-            forward_message(to, data, &clients);
-        }
-    }
-    
-    // Main loop: read and forward messages
-    loop {
-        let mut buffer = vec![0u8; 4096];
-        match stream.read(&mut buffer) {
-            Ok(0) => {
-                // Client disconnected
-                println!("❌ Client disconnected: {}", node_id);
-                let mut clients_map = clients.lock().unwrap();
-                clients_map.remove(&node_id);
-                println!("📊 Total clients: {}", clients_map.len());
+    // Task to send messages from channel to WebSocket
+    let send_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if ws_sender.send(Message::Text(msg)).await.is_err() {
                 break;
             }
-            Ok(n) => {
-                let data = &buffer[..n];
-                
-                // Parse message to get destination
-                if let Ok(msg) = serde_json::from_slice::<serde_json::Value>(data) {
-                    if let Some(to) = msg.get("to").and_then(|v| v.as_str()) {
-                        println!("📨 Forwarding message: {} → {}", node_id, to);
-                        forward_message(to, data, &clients);
+        }
+    });
+    
+    // Receive messages from WebSocket
+    while let Some(msg) = ws_receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                // Parse message to get node_id and destination
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                    // Register client on first message
+                    if node_id.is_none() {
+                        if let Some(from) = json.get("from").and_then(|v| v.as_str()) {
+                            node_id = Some(from.to_string());
+                            clients.lock().await.insert(from.to_string(), tx.clone());
+                            println!("✓ Registered: {} ({})", from, addr);
+                            println!("📊 Total clients: {}", clients.lock().await.len());
+                        }
+                    }
+                    
+                    // Forward message to destination
+                    if let Some(to) = json.get("to").and_then(|v| v.as_str()) {
+                        let clients_lock = clients.lock().await;
+                        if let Some(dest_tx) = clients_lock.get(to) {
+                            if dest_tx.send(text.clone()).is_ok() {
+                                if let Some(ref from) = node_id {
+                                    println!("📨 Forwarded: {} → {}", from, to);
+                                }
+                            }
+                        } else {
+                            println!("⚠️  Destination not found: {}", to);
+                        }
                     }
                 }
             }
+            Ok(Message::Close(_)) => break,
             Err(e) => {
-                eprintln!("Read error from {}: {}", node_id, e);
+                eprintln!("❌ WebSocket error: {}", e);
                 break;
             }
+            _ => {}
         }
     }
     
+    // Cleanup
+    if let Some(id) = node_id {
+        clients.lock().await.remove(&id);
+        println!("❌ Disconnected: {} ({})", id, addr);
+        println!("📊 Total clients: {}", clients.lock().await.len());
+    }
+    
+    send_task.abort();
     Ok(())
-}
-
-fn forward_message(
-    to: &str,
-    data: &[u8],
-    clients: &Arc<Mutex<HashMap<NodeId, TcpStream>>>,
-) {
-    let mut clients_map = clients.lock().unwrap();
-    
-    if let Some(dest_stream) = clients_map.get_mut(to) {
-        match dest_stream.write_all(data) {
-            Ok(_) => println!("✓ Message forwarded to {}", to),
-            Err(e) => eprintln!("❌ Failed to forward to {}: {}", to, e),
-        }
-    } else {
-        println!("⚠️  Destination not found: {}", to);
-    }
-}
-
-fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    
-    let port = if args.len() > 1 {
-        args[1].parse().unwrap_or(9000)
-    } else {
-        9000
-    };
-    
-    let server = RelayServer::new();
-    
-    println!("╔════════════════════════════════════════╗");
-    println!("║   P2P Relay Server - MVP               ║");
-    println!("╚════════════════════════════════════════╝\n");
-    
-    if let Err(e) = server.run(port) {
-        eprintln!("❌ Server error: {}", e);
-        std::process::exit(1);
-    }
 }
