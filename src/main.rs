@@ -1,15 +1,63 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use std::io::Cursor;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio_tungstenite::{accept_async_with_config, tungstenite::protocol::WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{StreamExt, SinkExt};
 
 type NodeId = String;
 type Clients = Arc<Mutex<HashMap<NodeId, tokio::sync::mpsc::UnboundedSender<String>>>>;
+
+// Wrapper to allow reading pre-buffered data before the actual stream
+struct PrefixedReadIo<S> {
+    stream: S,
+    prefix: Cursor<Vec<u8>>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedReadIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        // First read from prefix
+        if self.prefix.position() < self.prefix.get_ref().len() as u64 {
+            let pos = self.prefix.position() as usize;
+            let data = self.prefix.get_ref();
+            let available = &data[pos..];
+            let to_read = std::cmp::min(available.len(), buf.remaining());
+            buf.put_slice(&available[..to_read]);
+            self.prefix.set_position((pos + to_read) as u64);
+            return Poll::Ready(Ok(()));
+        }
+        // Then read from stream
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedReadIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -40,27 +88,40 @@ async fn main() {
 async fn handle_connection(mut stream: TcpStream, addr: SocketAddr, clients: Clients) -> Result<(), Box<dyn std::error::Error>> {
     println!("🔌 New connection from: {}", addr);
     
-    // Read first line to detect HTTP method
+    // Read first chunk to detect HTTP method
     let mut buf = vec![0u8; 1024];
-    let n = stream.peek(&mut buf).await?;
+    let n = stream.read(&mut buf).await?;
+    
+    if n == 0 {
+        return Ok(());
+    }
+    
     let request = String::from_utf8_lossy(&buf[..n]);
     
     // Simple health check for Render
-    if request.starts_with("GET / HTTP") && !request.contains("Upgrade: websocket") {
-        println!("💚 Health check from Render");
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await?;
+    // Check if it does NOT contain "Upgrade: websocket"
+    if !request.to_lowercase().contains("upgrade: websocket") {
+        println!("💚 Health check or plain HTTP from Render");
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK").await?;
         return Ok(());
     }
+    
+    // It is a WebSocket request!
+    // Create a prefixed stream that contains the data we already read
+    let prefixed_stream = PrefixedReadIo {
+        stream,
+        prefix: Cursor::new(buf[..n].to_vec()),
+    };
     
     // WebSocket connection
     let config = WebSocketConfig {
         max_message_size: Some(64 << 20),
         max_frame_size: Some(16 << 20),
         accept_unmasked_frames: false,
-        ..WebSocketConfig::default() // <--- ВОТ ИСПРАВЛЕНИЕ
+        ..WebSocketConfig::default()
     };
     
-    let ws_stream = accept_async_with_config(stream, Some(config)).await?;
+    let ws_stream = accept_async_with_config(prefixed_stream, Some(config)).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     
