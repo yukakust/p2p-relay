@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio_tungstenite::{accept_async_with_config, tungstenite::protocol::WebSocketConfig};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{StreamExt, SinkExt};
@@ -54,10 +54,10 @@ async fn handle_connection(mut stream: TcpStream, addr: SocketAddr, clients: Cli
     
     // WebSocket connection
     let config = WebSocketConfig {
-        max_send_queue: None,
         max_message_size: Some(64 << 20),
         max_frame_size: Some(16 << 20),
         accept_unmasked_frames: false,
+        ..WebSocketConfig::default() // <--- ВОТ ИСПРАВЛЕНИЕ
     };
     
     let ws_stream = accept_async_with_config(stream, Some(config)).await?;
